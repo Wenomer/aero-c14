@@ -1,0 +1,299 @@
+# Secrets needed (ESPHome Builder secrets.yaml; for local CLI builds also symlink esphome/secrets.yaml -> ../secrets.yaml):
+#   wifi_ssid, wifi_password, aero_c14__api_key (must match the key already on the board)
+# AERO 2 + NANO XS panel over RS485 (C14 protocol, 9600 8N1).
+# WARNING: verified ONLY on an AERO 2 controller with a NANO XS panel. Other models (AERO 3/4/5, NANO ONE/Color)
+# use different frames and registers; writing to the bus there may have unpredictable results. See README.md and docs/.
+# The board always listens to the bus. It writes only the verified registers 6-9 (power, day/night, speeds) and only after a command from HA;
+# there is no write switch, safety is in the code: register/value whitelist, no writes in the first 60 s after boot, one frame per bus window.
+# Board: Seeed XIAO ESP32-C6. RS485 module: Waveshare 3485 (RO->D7, DI->D8, RSE->D9).
+esphome:
+  name: aero-c14
+  friendly_name: AERO C14
+
+esp32:
+  board: seeed_xiao_esp32c6
+  variant: esp32c6
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG             # needed for raw bus frames (tag uart_debug)
+  logs:                    # silence sensor state noise
+    sensor: INFO
+    text_sensor: INFO
+    binary_sensor: INFO
+    number: INFO
+    switch: INFO
+
+api:
+  encryption:
+    key: !secret aero_c14__api_key
+
+ota:
+  - platform: esphome
+    encryption:        # OTA is encrypted with the API key, no separate password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "aero-c14 fallback"
+    password: "CHANGE_ME_AP_PASSWORD"   # fallback AP password (8+ chars): set your own before flashing
+
+captive_portal:
+
+globals:
+  - id: master_addr        # master (panel) address: 0x3E, observed
+    type: int
+    initial_value: '0x3E'
+  - id: tx_pending
+    type: bool
+    initial_value: 'false'
+  - id: tx_queued_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: tx_frame
+    type: std::vector<uint8_t>
+
+output:
+  - platform: gpio
+    pin: GPIO20      # D9 -> RSE (DE+RE); the GPIO output starts LOW = receive only
+    id: rs485_de_re
+
+uart:
+  id: bus485
+  tx_pin: GPIO19
+  rx_pin: GPIO17
+  baud_rate: 9600
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 1024
+  debug:
+    direction: RX
+    dummy_receiver: true
+    dummy_receiver_id: rx_sniffer
+    after:
+      timeout: 50ms        # a frame ends after a 50 ms pause
+    sequence:
+      - lambda: |-
+          UARTDebug::log_hex(direction, bytes, ' ');
+          if (bytes.size() != 30 || bytes[29] != 0x23) return;
+          uint32_t sum = 0;
+          for (int i = 0; i < 30; i++) if (i != 2) sum += bytes[i];
+          if ((sum & 0x7F) != bytes[2]) return;      // C14 checksum
+          uint8_t cmd = bytes[1];
+          // --- panel status (address 0x3E): speeds, on/off, day/night ---
+          if (cmd == 0x21 && bytes[3] == 0x3E) {
+            id(vent_speed).publish_state(bytes[16] / 10);
+            id(vent_day_speed).publish_state(bytes[17] / 10);
+            id(vent_night_speed).publish_state(bytes[18] / 10);
+            id(vent_on).publish_state(bytes[19] & 0x01);
+            id(vent_mode).publish_state((bytes[19] & 0x02) ? "Day" : "Night");
+          }
+          // --- controller telemetry (address 0x63): exhaust temperature, fans ---
+          if (cmd == 0x21 && bytes[3] == 0x63) {
+            int raw = bytes[16] * 128 + bytes[17] - 2000;      // 0.1 °C
+            id(vent_exhaust_temp).publish_state(raw / 10.0f);
+            // % per fan. Supply/exhaust order follows the AERO 3B documentation (byte 24 supply, 25 exhaust);
+            // not verified on AERO 2: both values are always equal here.
+            id(vent_fan_supply).publish_state(bytes[24]);
+            id(vent_fan_exhaust).publish_state(bytes[25]);
+          }
+          // --- replies to write/read (w, r, t) ---
+          if (cmd == 0x77 || cmd == 0x72 || cmd == 0x74) {
+            char buf[100]; int n = 0;
+            for (int i = 0; i < 30 && n < 95; i++) n += snprintf(buf + n, sizeof(buf) - n, "%02X ", bytes[i]);
+            id(c14_reply).publish_state(buf);
+          }
+          // --- iNext window: after the F0 44 poll the master is silent for ~0.9 s ---
+          if (bytes[0] == 0xF0 && cmd == 0x44 && bytes[3] == id(master_addr) && id(tx_pending)) {
+            id(tx_pending) = false;
+            if (millis() - id(tx_queued_ms) < 30000) {
+              id(send_pending).execute();
+            } else {
+              ESP_LOGW("c14", "Queued write dropped (expired)");
+            }
+          }
+
+script:
+  - id: send_pending
+    mode: single
+    then:
+      - output.turn_on: rs485_de_re
+      - delay: 1ms
+      - uart.write:
+          id: bus485
+          data: !lambda 'return id(tx_frame);'
+      - delay: 45ms          # 30 bytes at 9600 baud = ~31 ms
+      - output.turn_off: rs485_de_re
+      - lambda: 'ESP_LOGW("c14", "W frame sent");'
+  # Register write from HA: queues a write frame, sent in the window after F0 44
+  - id: queue_register
+    mode: restart
+    parameters:
+      reg: int
+      val: int
+    then:
+      - lambda: |-
+          // never write right after boot (the bus and HA state are not settled yet)
+          if (millis() < 60000) { id(c14_status).publish_state("writes locked for 60 s after boot"); return; }
+          // only verified registers: 6 on/off, 7 day/night (0..1), 8/9 day/night speed (1..10)
+          bool ok = ((reg == 6 || reg == 7) && (val == 0 || val == 1)) || ((reg == 8 || reg == 9) && val >= 1 && val <= 10);
+          if (!ok) { id(c14_status).publish_state("rejected"); return; }
+          std::vector<uint8_t> f(30, 0x00);
+          f[0] = 0x80 + id(master_addr); f[1] = 0x57; f[3] = 0x70; f[4] = 0x00;
+          for (int i = 0; i < 6; i++) { f[5 + i*4 + 2] = 0x0F; f[5 + i*4 + 3] = 0x50; }
+          int raw = val + 2000;
+          f[5] = (reg / 128) & 0x7F; f[6] = (reg % 128) & 0x7F;
+          f[7] = (raw / 128) & 0x7F; f[8] = (raw % 128) & 0x7F;
+          f[29] = 0x23;
+          uint32_t s = 0; for (int i = 0; i < 30; i++) if (i != 2) s += f[i];
+          f[2] = s & 0x7F;
+          id(tx_frame) = f; id(tx_queued_ms) = millis(); id(tx_pending) = true;
+          id(c14_status).publish_state(reg == 6 ? "power write queued" : reg == 7 ? "mode write queued" : reg == 8 ? "day speed write queued" : "night speed write queued");
+
+switch:
+  # Ventilation power from HA (register 6). Shows the actual state read from the bus.
+  - platform: template
+    name: "Ventilation power"
+    id: ctl_power
+    icon: mdi:fan
+    restore_mode: DISABLED   # never act on boot: the default would send a "power off" write at every start
+    lambda: |-
+      if (!id(vent_on).has_state()) return {};
+      return id(vent_on).state;
+    turn_on_action:
+      - script.execute:
+          id: queue_register
+          reg: 6
+          val: 1
+    turn_off_action:
+      - script.execute:
+          id: queue_register
+          reg: 6
+          val: 0
+
+number:
+  # Speed control: shows the actual value from the bus, writes to the panel register on change
+  - platform: template
+    name: "Day speed control"
+    id: ctl_day_speed
+    icon: mdi:weather-sunny
+    min_value: 1
+    max_value: 10
+    step: 1
+    mode: slider
+    update_interval: 4s
+    lambda: |-
+      float v = id(vent_day_speed).state;
+      if (std::isnan(v)) return {};
+      return v;
+    set_action:
+      - script.execute:
+          id: queue_register
+          reg: 8
+          val: !lambda 'return (int) x;'
+  - platform: template
+    name: "Night speed control"
+    id: ctl_night_speed
+    icon: mdi:weather-night
+    min_value: 1
+    max_value: 10
+    step: 1
+    mode: slider
+    update_interval: 4s
+    lambda: |-
+      float v = id(vent_night_speed).state;
+      if (std::isnan(v)) return {};
+      return v;
+    set_action:
+      - script.execute:
+          id: queue_register
+          reg: 9
+          val: !lambda 'return (int) x;'
+
+select:
+  # Day/night mode from HA (register 7). Shows the actual mode read from the bus.
+  - platform: template
+    name: "Ventilation mode control"
+    id: ctl_mode
+    icon: mdi:theme-light-dark
+    options:
+      - Day
+      - Night
+    update_interval: 4s
+    lambda: |-
+      if (!id(vent_mode).has_state()) return {};
+      return id(vent_mode).state;
+    set_action:
+      - script.execute:
+          id: queue_register
+          reg: 7
+          val: !lambda 'return x == "Day" ? 1 : 0;'
+
+sensor:
+  - platform: uptime
+    name: "Uptime"
+  - platform: wifi_signal
+    name: "WiFi signal"
+    update_interval: 60s
+  - platform: template
+    name: "Ventilation speed"
+    id: vent_speed
+    accuracy_decimals: 0
+    icon: mdi:fan
+  - platform: template
+    name: "Ventilation day speed"
+    id: vent_day_speed
+    accuracy_decimals: 0
+    icon: mdi:weather-sunny
+  - platform: template
+    name: "Ventilation night speed"
+    id: vent_night_speed
+    accuracy_decimals: 0
+    icon: mdi:weather-night
+  - platform: template
+    name: "Exhaust air temperature"
+    id: vent_exhaust_temp
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+  - platform: template
+    name: "Supply fan percent"
+    id: vent_fan_supply
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+  - platform: template
+    name: "Exhaust fan percent"
+    id: vent_fan_exhaust
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+
+button:
+  - platform: restart
+    name: "Restart"
+
+binary_sensor:
+  - platform: template
+    name: "Ventilation on"
+    id: vent_on
+    device_class: running
+
+text_sensor:
+  - platform: template
+    name: "Ventilation mode"
+    id: vent_mode
+    icon: mdi:theme-light-dark
+  - platform: template
+    name: "C14 last reply"
+    id: c14_reply
+    entity_category: diagnostic
+  - platform: template
+    name: "C14 write status"
+    id: c14_status
+    entity_category: diagnostic
+  - platform: version
+    name: "ESPHome version"
