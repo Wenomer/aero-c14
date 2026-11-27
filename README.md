@@ -28,6 +28,7 @@ ESPHome firmware that connects an **AERO 2** heat-recovery ventilation controlle
 | [docs/FLASHING.md](docs/FLASHING.md) | **what to flash and where**: wiring, flashing, HA Builder, usage |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | description of the C14 protocol on this bus |
 | [docs/REGISTERS.md](docs/REGISTERS.md) | known and unknown registers |
+| [nano-one/](nano-one/README.md) | a second installation: **NANO ONE** panel + AERO ("AERO5 v.57"), separate config and register map |
 
 ## Quick start
 

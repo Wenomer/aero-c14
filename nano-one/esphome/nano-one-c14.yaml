@@ -1,0 +1,457 @@
+# Compit NANO ONE panel (C14 bus address 0x29 = 41, "Master Mini") + AERO controller
+# (0x63 = 99; the panel info screen says "WENTYLACJA AERO5 v.57") in an O3ozon A-250 recuperator.
+# Board: M5Stack AtomS3 Lite + Tail485 (Tail485 switches the TX direction by itself), powered
+# from the bus terminal U (9-24 V, Tail485 has its own DC-DC). Grove port G1/G2.
+# Wiring on the AERO board terminals: 35 U, 36 G, 37 B, 38 A (same as the panel cable).
+#
+# What it does: parses bus frames passively, and reads/writes panel registers in the iNext (0x70)
+# window after the "F0 44 .. 29" poll. Writes happen ONLY while the "write enable" switch is on
+# (it is always off after boot). See ../README.md for the register map and what was verified.
+# Entity names are in Russian (the author's HA); rename freely - but note that ESPHome derives
+# unique_id from the name, so renaming later creates new entities in HA.
+substitutions:
+  name: recuperator
+  friendly: "Рекуператор (мост RS485)"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly}
+  includes:
+    - c14.h
+  on_boot:
+    priority: -100
+    then:
+      - delay: 30s
+      - lambda: |-
+          if (id(txbuf).empty()) { id(txbuf) = c14_read(108); id(tx_tries) = 0; }   // сначала скорости дня/ночи
+
+esp32:
+  board: m5stack-atoms3
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+
+logger:
+  baud_rate: 0          # UART занят шиной, лог только по Wi-Fi
+
+api:
+  encryption:
+    key: !secret recuperator_api_key
+
+ota:
+  - platform: esphome
+    password: !secret recuperator_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Recuperator Fallback"
+
+captive_portal:
+
+# Optional: raw RS485 <-> TCP bridge for sniffing from a PC (oxan/esphome-stream-server, GPL-3.0).
+# Upstream needs a one-line patch for ESPHome 2026.11 (dump_config uses the removed
+# network::get_use_address()); see ../README.md. Uncomment together with stream_server below.
+# external_components:
+#   - source: github://oxan/esphome-stream-server
+
+uart:
+  id: bus
+  tx_pin: GPIO2
+  rx_pin: GPIO1
+  baud_rate: 9600
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 1024
+  # Разбор кадров C14 "на лету" из того, что читает мост. На шину ничего не пишем.
+  debug:
+    direction: RX
+    dummy_receiver: false
+    after:
+      timeout: 20ms
+    sequence:
+      - lambda: |-
+          static std::vector<uint8_t> acc;
+          acc.insert(acc.end(), bytes.begin(), bytes.end());
+          if (acc.size() > 600) acc.erase(acc.begin(), acc.end() - 60);
+          auto val = [](uint8_t hi, uint8_t lo) -> float {
+            int raw = hi * 128 + lo;
+            if (raw == 11999 || raw == 0) return NAN;   // 5D 5F = "нет датчика"
+            return (raw - 2000) / 10.0f;
+          };
+          // Ловушка неизвестных событий: байты статусов без уже расшифрованных битов
+          auto hexs = [](const uint8_t *f, std::initializer_list<int> idx, std::initializer_list<std::pair<int,int>> masks) {
+            std::string s; char b[4];
+            for (int i : idx) {
+              uint8_t v = f[i];
+              for (auto &m : masks) if (m.first == i) v &= (uint8_t) m.second;
+              snprintf(b, sizeof(b), "%02X", v); s += b;
+            }
+            return s;
+          };
+          auto pubtxt = [](text_sensor::TextSensor *s, const std::string &v) {
+            if (!s->has_state() || s->state != v) s->publish_state(v);
+          };
+          auto pub = [](sensor::Sensor *s, float v) {
+            if (std::isnan(v)) return;
+            if (!s->has_state() || std::fabs(s->state - v) > 0.05f) s->publish_state(v);
+          };
+          while (acc.size() >= 30) {
+            int sum = 0;
+            for (int k = 0; k < 30; k++) if (k != 2) sum += acc[k];
+            if (acc[29] != 0x23 || (sum & 0x7F) != acc[2] || (acc[0] & 0x80) == 0) { acc.erase(acc.begin()); continue; }
+            const uint8_t *f = acc.data();
+            if (f[1] == 0x21 && f[3] == 0x63) {          // ответ контроллера AERO
+              id(last_aero) = millis();
+              pub(id(t_intake), val(f[10], f[11]));
+              pub(id(t_fan), val(f[14], f[15]));
+              pub(id(t_c), val(f[16], f[17]));
+              pub(id(t_d), val(f[18], f[19]));
+              pub(id(gear), f[26]);
+              // % скоростей из регистров панели 116-118 (прочитаны 26.11.2026): I=30, II=50, III=100
+              if (f[26] >= 1 && f[26] <= 3) pub(id(fan_pct), (float) id(gear_pct)[f[26] - 1]);
+              else if (f[26] == 0) pub(id(fan_pct), 0.0f);  // 0 = вентиляторы стоят (Urlop / STOP)
+              bool bp = (f[28] & 0x20) != 0;                // флаги AERO: 0x20 = байпас открыт
+              // байт 27: 02 = вентиляторы работают, 00 = стоп (27.11) - в ловушку не идёт
+              pubtxt(id(flags_aero), hexs(f, {4,5,6,7,8,9,20,21,22,23,24,25,28}, {{28, 0xDF}}));
+              if (!id(bypass_open).has_state() || id(bypass_open).state != bp) id(bypass_open).publish_state(bp);
+            } else if (f[0] == 0xE4 && f[1] == 0x21 && f[3] == 0x29) {   // статус панели Nano One
+              id(last_panel) = millis();
+              pub(id(t_room), val(f[12], f[13]));
+              pub(id(t_set), val(f[14], f[15]));
+              bool night = (f[5] & 0x10) == 0;                    // 0A 50 = день, 0A 40 = ночь
+              if (!id(day_night).has_state() || id(day_night).state != (night ? "Ночь" : "День")) id(day_night).publish_state(night ? "Ночь" : "День");
+              static uint8_t rot[4] = {0, 0, 0, 0};             // байт 25 = индекс 1..3, байт 26 = значение
+              static uint8_t seen = 0;
+              if (f[25] >= 1 && f[25] <= 3) { rot[f[25]] = f[26]; seen |= (1 << f[25]); }
+              char rb[16]; snprintf(rb, sizeof(rb), "|%02X%02X%02X", rot[1], rot[2], rot[3]);
+              (void) rb; (void) seen;                               // байт 7 = день недели, 25/26 = ГГ/ММ/ДД: в ловушку не идут
+              pubtxt(id(flags_panel), hexs(f, {4,5,6,10,11,16,17,18,19,20,21,22,24,27}, {{5, 0xEF}, {27, 0xF7}}));
+            } else if (f[0] == 0xE4 && f[1] == 0x2A && f[3] == 0x29) {   // кадр настроек панели
+              int bm = f[27] & 0x03;                                  // биты 0-1: байпас, бит 0x08: лето
+              const char *m = bm == 0 ? "Закрыт" : bm == 1 ? "Авто" : bm == 2 ? "Открыт" : "?";
+              const char *se = (f[27] & 0x08) ? "Лето" : "Зима";
+              if (id(season).state != se) id(season).publish_state(se);
+              std::vector<int> si; for (int i = 4; i <= 26; i++) si.push_back(i);
+              std::string ss; char hb[4]; for (int i : si) { snprintf(hb, sizeof(hb), "%02X", f[i]); ss += hb; }
+              snprintf(hb, sizeof(hb), "%02X", f[27] & 0xF4); ss += hb;
+              pubtxt(id(flags_settings), ss);
+              if (id(bypass_mode).state != m) id(bypass_mode).publish_state(m);
+            }
+            if (f[0] == 0xF0 && f[3] == 0x29 && f[1] == 0x44) {        // панель предлагает слот iNext
+              if (!id(txbuf).empty()) {
+                if (id(tx_tries) >= 5) {
+                  id(tx_result).publish_state(id(txbuf)[1] == 0x57 ? "Запись: нет ответа" : "Чтение: нет ответа");
+                  id(txbuf).clear();
+                } else {
+                  id(tx_send).execute();
+                }
+              }
+            } else if (f[0] == 0xF0 && f[3] == 0x29 && (f[1] == 0x72 || f[1] == 0x77)) {   // ответ панели нам
+              bool was_write = f[1] == 0x77;
+              for (int k = 0; k < 6; k++) {
+                int o = 5 + k * 4;
+                int reg = f[o] * 128 + f[o + 1];
+                int v = f[o + 2] * 128 + f[o + 3] - 2000;
+                if (reg >= 116 && reg <= 118 && v >= 0 && v <= 100) {
+                  id(gear_pct)[reg - 116] = v;
+                  number::Number *n = reg == 116 ? id(fan_i) : reg == 117 ? id(fan_ii) : id(fan_iii);
+                  if (!n->has_state() || n->state != v) n->publish_state(v);
+                }
+                if ((reg == 111 || reg == 112) && v >= 1 && v <= 3) {   // скорость режима День / Ночь
+                  const char *nm[] = {"", "I", "II", "III"};
+                  select::Select *s = reg == 111 ? id(speed_day) : id(speed_night);
+                  auto ai = s->active_index();
+                  if (!ai.has_value() || *ai != (size_t) (v - 1)) s->publish_state(nm[v]);
+                }
+                if (reg == 169 && v >= 0 && v <= 365) pub(id(filter_period), (float) v);   // Okres czyszcz. filtra, дни
+                if (reg == 21 && (v == 0 || v == 1)) {                   // Urlop: 1 = вентиляция остановлена
+                  if (!id(urlop).has_state() || id(urlop).state != (v == 1)) id(urlop).publish_state(v == 1);
+                }
+              }
+              if (!id(txbuf).empty() && f[1] == (id(txbuf)[1] | 0x20)) {
+                char b[64];
+                snprintf(b, sizeof(b), "%s OK, попыток: %d", was_write ? "Запись" : "Чтение", (int) id(tx_tries));
+                id(tx_result).publish_state(b);
+                id(txbuf).clear();
+                if (was_write) {                                               // сразу перечитать записанный регистр
+                  int wr = f[5] * 128 + f[6];
+                  id(txbuf) = c14_read(wr >= 116 && wr <= 118 ? 116 : wr); id(tx_tries) = 0;
+                }
+              }
+            }
+            acc.erase(acc.begin(), acc.begin() + 30);
+          }
+
+globals:
+  - id: txbuf
+    type: std::vector<uint8_t>
+  - id: tx_tries
+    type: int
+    initial_value: '0'
+  - id: gear_pct
+    type: std::array<int, 3>
+    initial_value: '{30, 50, 100}'
+  - id: last_aero
+    type: uint32_t
+    initial_value: '0'
+  - id: last_panel
+    type: uint32_t
+    initial_value: '0'
+
+script:
+  - id: tx_send
+    mode: single
+    then:
+      - delay: 60ms
+      - lambda: |-
+          if (id(txbuf).empty()) return;
+          id(bus).write_array(id(txbuf).data(), id(txbuf).size());
+          id(tx_tries)++;
+
+interval:
+  # по кругу: 18-23 (Urlop=21), 108-113 (скорости дня/ночи 111/112), 116-121 (проценты I/II/III) - каждый блок раз в 5 мин
+  - interval: 100s
+    then:
+      - lambda: |-
+          static int k = 0;
+          const int blocks[4] = {18, 108, 116, 166};                 // 166-171: 169 = период фильтра
+          if (id(txbuf).empty()) { id(txbuf) = c14_read(blocks[k]); id(tx_tries) = 0; k = (k + 1) % 4; }
+
+select:
+  - platform: template
+    id: speed_day
+    name: "Скорость днём"
+    icon: mdi:weather-sunny
+    options: ["I", "II", "III"]
+    optimistic: false
+    set_action:
+      - lambda: |-
+          int v = x == "I" ? 1 : x == "II" ? 2 : 3;
+          if (!id(write_enable).state) { id(tx_result).publish_state("Запись выключена"); return; }
+          id(txbuf) = c14_write1(111, v); id(tx_tries) = 0; id(tx_result).publish_state("Запись: ждём окно");
+  - platform: template
+    id: speed_night
+    name: "Скорость ночью"
+    icon: mdi:weather-night
+    options: ["I", "II", "III"]
+    optimistic: false
+    set_action:
+      - lambda: |-
+          int v = x == "I" ? 1 : x == "II" ? 2 : 3;
+          if (!id(write_enable).state) { id(tx_result).publish_state("Запись выключена"); return; }
+          id(txbuf) = c14_write1(112, v); id(tx_tries) = 0; id(tx_result).publish_state("Запись: ждём окно");
+
+switch:
+  - platform: template
+    id: write_enable
+    name: "Разрешить запись"
+    icon: mdi:pencil-lock
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+  - platform: template
+    id: urlop
+    name: "Отпуск (стоп вентиляции)"
+    icon: mdi:bag-suitcase
+    optimistic: false
+    restore_mode: DISABLED
+    turn_on_action:
+      - lambda: |-
+          if (!id(write_enable).state) { id(tx_result).publish_state("Запись выключена"); id(urlop).publish_state(id(urlop).state); return; }
+          id(txbuf) = c14_write1(21, 1); id(tx_tries) = 0; id(tx_result).publish_state("Запись: ждём окно");
+    turn_off_action:
+      - lambda: |-
+          if (!id(write_enable).state) { id(tx_result).publish_state("Запись выключена"); id(urlop).publish_state(id(urlop).state); return; }
+          id(txbuf) = c14_write1(21, 0); id(tx_tries) = 0; id(tx_result).publish_state("Запись: ждём окно");
+
+number:
+  - platform: template
+    id: fan_i
+    name: "Скорость I, %"
+    icon: mdi:fan-speed-1
+    min_value: 0
+    max_value: 100
+    step: 10
+    unit_of_measurement: "%"
+    mode: slider
+    optimistic: false
+    set_action:
+      - lambda: |-
+          int v = (int) x;
+          if (!id(write_enable).state) { id(tx_result).publish_state("Запись выключена"); if (id(fan_i).has_state()) id(fan_i).publish_state(id(fan_i).state); return; }
+          if (v < 10 || v > 100 || v % 10 != 0) { id(tx_result).publish_state("Недопустимое значение"); return; }
+          id(txbuf) = c14_write1(116, v); id(tx_tries) = 0; id(tx_result).publish_state("Запись: ждём окно");
+  - platform: template
+    id: fan_ii
+    name: "Скорость II, %"
+    icon: mdi:fan-speed-2
+    min_value: 0
+    max_value: 100
+    step: 10
+    unit_of_measurement: "%"
+    mode: slider
+    optimistic: false
+    set_action:
+      - lambda: |-
+          int v = (int) x;
+          if (!id(write_enable).state) { id(tx_result).publish_state("Запись выключена"); if (id(fan_ii).has_state()) id(fan_ii).publish_state(id(fan_ii).state); return; }
+          if (v < 10 || v > 100 || v % 10 != 0) { id(tx_result).publish_state("Недопустимое значение"); return; }
+          id(txbuf) = c14_write1(117, v); id(tx_tries) = 0; id(tx_result).publish_state("Запись: ждём окно");
+  - platform: template
+    id: fan_iii
+    name: "Скорость III, %"
+    icon: mdi:fan-speed-3
+    min_value: 0
+    max_value: 100
+    step: 10
+    unit_of_measurement: "%"
+    mode: slider
+    optimistic: false
+    set_action:
+      - lambda: |-
+          int v = (int) x;
+          if (!id(write_enable).state) {
+            id(tx_result).publish_state("Запись выключена");
+            if (id(fan_iii).has_state()) id(fan_iii).publish_state(id(fan_iii).state);
+            return;
+          }
+          if (v < 10 || v > 100 || v % 10 != 0) { id(tx_result).publish_state("Недопустимое значение"); return; }
+          id(txbuf) = c14_write1(118, v);
+          id(tx_tries) = 0;
+          id(tx_result).publish_state("Запись: ждём окно");
+
+# stream_server:
+#   uart_id: bus
+#   port: 6638
+
+sensor:
+  - platform: template
+    id: filter_period
+    name: "Период чистки фильтра (filter)"
+    icon: mdi:air-filter
+    unit_of_measurement: "дн."
+    accuracy_decimals: 0
+    entity_category: diagnostic
+  - platform: wifi_signal
+    name: "Wi-Fi сигнал"
+    update_interval: 60s
+  - platform: uptime
+    name: "Время работы"
+  - platform: template
+    id: gear
+    name: "Скорость"
+    icon: mdi:fan
+    accuracy_decimals: 0
+    state_class: measurement
+  - platform: template
+    id: fan_pct
+    name: "Мощность вентиляторов"
+    unit_of_measurement: "%"
+    icon: mdi:fan-speed-1
+    accuracy_decimals: 0
+    state_class: measurement
+  - platform: template
+    id: t_room
+    name: "Температура у панели"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    id: t_set
+    name: "Уставка"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    id: t_intake
+    name: "Забор воздуха"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    id: t_fan
+    name: "Температура 26 (экран)"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    id: t_c
+    name: "Температура C"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    id: t_d
+    name: "Температура D"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+text_sensor:
+  - platform: template
+    id: flags_aero
+    name: "Флаги AERO (неизвестные)"
+    icon: mdi:flag-outline
+    entity_category: diagnostic
+  - platform: template
+    id: flags_panel
+    name: "Флаги панели (неизвестные)"
+    icon: mdi:flag-outline
+    entity_category: diagnostic
+  - platform: template
+    id: flags_settings
+    name: "Флаги настроек (неизвестные)"
+    icon: mdi:flag-outline
+    entity_category: diagnostic
+  - platform: template
+    id: day_night
+    name: "День / Ночь"
+    icon: mdi:theme-light-dark
+  - platform: template
+    id: tx_result
+    name: "Регистры: результат"
+    icon: mdi:swap-vertical
+  - platform: template
+    id: season
+    name: "Сезон"
+    icon: mdi:sun-snowflake-variant
+  - platform: template
+    id: bypass_mode
+    name: "Режим байпаса"
+    icon: mdi:valve
+
+binary_sensor:
+  - platform: template
+    id: bypass_open
+    name: "Байпас открыт"
+    icon: mdi:valve-open
+  - platform: status
+    name: "На связи"
+  # - platform: stream_server
+  #   connected:
+  #     name: "Мост: клиент подключён"
+  - platform: template
+    name: "Связь с контроллером AERO"
+    device_class: connectivity
+    lambda: 'return id(last_aero) != 0 && (millis() - id(last_aero)) < 30000;'
+  - platform: template
+    name: "Связь с панелью"
+    device_class: connectivity
+    lambda: 'return id(last_panel) != 0 && (millis() - id(last_panel)) < 30000;'
+
+light:
+  - platform: esp32_rmt_led_strip
+    channel_colors: GRB
+    pin: GPIO35
+    num_leds: 1
+    chipset: ws2812
+    name: "Светодиод"
