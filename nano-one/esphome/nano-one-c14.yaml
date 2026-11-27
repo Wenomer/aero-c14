@@ -167,6 +167,7 @@ uart:
                   auto ai = s->active_index();
                   if (!ai.has_value() || *ai != (size_t) (v - 1)) s->publish_state(nm[v]);
                 }
+                if (reg == 169 && v >= 0 && v <= 365) pub(id(filter_period), (float) v);   // Okres czyszcz. filtra, дни
                 if (reg == 21 && (v == 0 || v == 1)) {                   // Urlop: 1 = вентиляция остановлена
                   if (!id(urlop).has_state() || id(urlop).state != (v == 1)) id(urlop).publish_state(v == 1);
                 }
@@ -217,8 +218,8 @@ interval:
     then:
       - lambda: |-
           static int k = 0;
-          const int blocks[3] = {18, 108, 116};
-          if (id(txbuf).empty()) { id(txbuf) = c14_read(blocks[k]); id(tx_tries) = 0; k = (k + 1) % 3; }
+          const int blocks[4] = {18, 108, 116, 166};                 // 166-171: 169 = период фильтра
+          if (id(txbuf).empty()) { id(txbuf) = c14_read(blocks[k]); id(tx_tries) = 0; k = (k + 1) % 4; }
 
 select:
   - platform: template
@@ -327,6 +328,13 @@ number:
 #   port: 6638
 
 sensor:
+  - platform: template
+    id: filter_period
+    name: "Период чистки фильтра (filter)"
+    icon: mdi:air-filter
+    unit_of_measurement: "дн."
+    accuracy_decimals: 0
+    entity_category: diagnostic
   - platform: wifi_signal
     name: "Wi-Fi сигнал"
     update_interval: 60s

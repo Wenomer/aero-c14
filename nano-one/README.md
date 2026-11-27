@@ -79,6 +79,8 @@ The panel misses about 1 in 3 requests: retry up to 5 times.
 | 108–110 | 4, 44, 5 | ❓ |
 | **111** | **day-mode gear** 1–3 | ✅ read + write, applied immediately |
 | **112** | **night-mode gear** 1–3 | ✅ read + write, applied immediately |
+| 136 / 137 / 138 / 140 | 1 / 0 / 16 / 10: "poza domem" program (30 min / 30 min), secondary heater off, min. supply temp 16 °C, supply-temp correction gain 10 (match the service menu) | ✅ read |
+| **169** | **filter cleaning period, days** ("Okres czyszcz. filtra"); the panel shows "remaining" = period − days elapsed | ✅ read (61→62→86 changed only this register); the firmware publishes it |
 | 116–118 | 30 / 50 / 100 | ⚠️ write accepted, **no effect on the fans** |
 | 130–135 | 30 / 60 / 100, 30 / 60 / 100 | ⚠️ write accepted, **no effect on the fans** |
 | 197–204 | 30 / 60 / 80 / 100, 30 / 60 / 80 / 100 | ⚠️ write accepted, **no effect on the fans** |
@@ -87,6 +89,12 @@ The panel misses about 1 in 3 requests: retry up to 5 times.
 | 162–167, 288, 300 | never answer | — |
 
 "No effect" was tested by ear: gear I set to 60–100 % (and the gear toggled I→II→I so the panel re-applies it) stayed clearly quieter than gear II. So on this installation the **per-gear fan output is not in the panel registers** we can read.
+
+## Service menu (NANO ONE, installer code 0199)
+
+Code **0199** opens SERWIS (0000/0001 do not). The "Wentylacja" list for this controller has **no per-gear fan %**: min. supply temperature, "poza domem" program, secondary heater mode, correction gains, fan run-on, filter period, defrost threshold (5 °C) / hysteresis (4.0) / method (fan off), **PRESS input function** (here: *wietrzenie*/airing, so there is no dirty-filter pressure switch), outdoor temp from intake sensor, bypass permission. "Przywracanie nastaw" = factory reset, leave it alone.
+
+This matches the AERO 5 manual (DTR v5.37): the controller drives the fans through **three relays R3/R4/R5 = gear 1/2/3** (R1 bypass, R2 ozonator, PWM outputs for heater SSRs) and has no 0–10 V fan output. So with AERO 5 smooth / 10-step speed is not possible over C14; it would need hardware changes (EC fan control signal) or a different controller (AERO 3/4/MF have per-gear % parameters).
 
 ## Reading the AERO controller directly
 
@@ -103,12 +111,14 @@ The controller **answers reads from the iNext slot** too: `E3 52 cs 70 …` → 
 ## Firmware behaviour
 
 - Passive parsing: gear, temperatures, bypass, season, day/night, setpoint, links to panel and controller.
-- Every 100 s, round-robin read of panel blocks 18 (Urlop), 108 (gears) and 116.
+- Every 100 s, round-robin read of panel blocks 18 (Urlop), 108 (gears), 116 and 166 (filter period).
+- Controls (only with the write switch on): day gear (111), night gear (112), Urlop (21).
+- ESPHome 2026.11 builds internal IDs from the ASCII part of a name: two Cyrillic-only names of the same length collide, so one entity name carries "(filter)".
 - Writes: one register per frame, the same slot repeated 6 times (no empty `00 00 0F 50` slots), only from HA, only with the write switch on; the panel's `F0 77` reply is checked, then the register is re-read.
 - "Unknown flags" diagnostic sensors: status bytes with all decoded bits masked out, so any change means something new (filter alarm, fault…).
 
 ## Open questions
 
-- Where the per-gear fan % lives for NANO ONE + AERO5 (smooth 10-step control like NANO XS?).
-- Is the controller the same hardware as AERO 2? Compare the controller board labels / panel info screens.
+- Is the controller the same hardware as AERO 2? Compare the controller board labels / panel info screens. (If yours has per-gear % or 10 steps, it is not an AERO 5.)
+- The filter "days elapsed" counter is not in the readable registers so far (maybe 162–165, which never answer); a day-to-day diff is planned.
 - Filter alarm ("Wyczyść filtr") bits.
